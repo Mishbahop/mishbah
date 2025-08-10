@@ -32,12 +32,9 @@ def get_user_keyboard():
         KeyboardButton('🎮 Games'),
         KeyboardButton('🎫 My Tournaments')
     )
+   
+    
     markup.add(
-        KeyboardButton('💰 My Wallet'),
-        KeyboardButton('⭐ My Points')
-    )
-    markup.add(
-        KeyboardButton('➕ Deposit'),
         KeyboardButton('✉️ Contact Admin')
     )
     return markup
@@ -53,11 +50,6 @@ def get_admin_keyboard():
         KeyboardButton('🎫 My Tournaments')
     )
     markup.add(
-        KeyboardButton('💰 My Wallet'),
-        KeyboardButton('⭐ My Points')
-    )
-    markup.add(
-        KeyboardButton('➕ Deposit'),
         KeyboardButton('➕ Add Tournament'),
         KeyboardButton('❌ Delete Tournament')
     )
@@ -390,33 +382,120 @@ def add_tournament(message):
     if not is_admin(message.from_user.id):
         bot.reply_to(message, "🚫 You are not authorized to add tournaments.")
         return
-    msg = (
-        "✍️ <b>Send tournament details in this format:</b>\n"
-        "game name date prize\n"
-        "<i>Example:</i>\n"
-        "BGMI SummerCup 2025-08-10 1000Rs"
-    )
-    bot.reply_to(message, msg, parse_mode='HTML')
-    bot.register_next_step_handler(message, save_tournament)
+    bot.reply_to(message, "🎯 Enter the game name (e.g., BGMI, Free Fire):")
+    bot.register_next_step_handler(message, tournament_step_game)
 
-def save_tournament(message):
-    args = message.text.split()
-    if len(args) < 4:
-        bot.reply_to(message, "❗ Invalid format. Usage: game name date prize\nExample: BGMI SummerCup 2025-08-10 1000Rs")
+def tournament_step_game(message):
+    game = message.text.strip()
+    bot.reply_to(message, "🏆 Enter the tournament name:")
+    bot.register_next_step_handler(message, tournament_step_name, game)
+
+def tournament_step_name(message, game):
+    name = message.text.strip()
+    bot.reply_to(message, "📅 Enter the tournament date (YYYY-MM-DD):")
+    bot.register_next_step_handler(message, tournament_step_date, game, name)
+
+def tournament_step_date(message, game, name):
+    date = message.text.strip()
+    bot.reply_to(message, "💰 Enter the prize amount (e.g., ₹1000):")
+    bot.register_next_step_handler(message, tournament_step_prize, game, name, date)
+
+def tournament_step_prize(message, game, name, date):
+    prize = message.text.strip()
+    bot.reply_to(message, "💵 Enter the entry fee (number only):")
+    bot.register_next_step_handler(message, save_tournament, game, name, date, prize)
+
+def save_tournament(message, game, name, date, prize):
+    try:
+        entry_fee = int(message.text.strip())
+    except ValueError:
+        bot.reply_to(message, "❗ Please enter a valid number for entry fee.")
+        bot.register_next_step_handler(message, save_tournament, game, name, date, prize)
         return
-    game = args[0]
-    date = args[-2]
-    prize = args[-1]
-    name = " ".join(args[1:-2])
-    tournaments.append({"game": game, "name": name, "date": date, "prize": prize})
-    bot.reply_to(message, f"✅ Tournament added: <b>{game}</b> | {name} | {date} | 💰 {prize}", parse_mode='HTML')
-    # Notify only users who registered for this game
+    
+    tournaments.append({
+        "game": game,
+        "name": name,
+        "date": date,
+        "prize": prize,
+        "entry_fee": entry_fee
+    })
+    
+    bot.reply_to(
+        message,
+        f"✅ Tournament Added:\n\n"
+        f"🎯 Game: {game}\n"
+        f"🏆 Name: {name}\n"
+        f"📅 Date: {date}\n"
+        f"💰 Prize: {prize}\n"
+        f"💵 Entry Fee: ₹{entry_fee}",
+        parse_mode='HTML'
+    )
+    
+    # Notify only relevant users
     for uid in users:
         if game in get_user(uid)["games"]:
             try:
-                bot.send_message(uid, f"📢 <b>New {game} Tournament:</b>\n{name} | {date} | 💰 {prize}", parse_mode='HTML')
-            except Exception:
+                bot.send_message(
+                    uid,
+                    f"📢 <b>New {game} Tournament!</b>\n\n"
+                    f"🏆 {name}\n"
+                    f"📅 Date: {date}\n"
+                    f"💰 Prize: {prize}\n"
+                    f"💵 Entry Fee: ₹{entry_fee}",
+                    parse_mode='HTML'
+                )
+            except:
                 pass
+
+@bot.message_handler(func=lambda m: m.text in ['🏆 Tournaments', '/tournaments'])
+def tournaments_cmd(message):
+    if not tournaments:
+        bot.reply_to(message, "😔 No tournaments available right now.")
+        return
+    
+    for idx, t in enumerate(tournaments):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton(f"Join {t['name']}", callback_data=f"join_{idx}"))
+        
+        bot.send_message(
+            message.chat.id,
+            f"🎯 Game: {t['game']}\n"
+            f"🏆 Name: {t['name']}\n"
+            f"📅 Date: {t['date']}\n"
+            f"💰 Prize: {t['prize']}\n"
+            f"💵 Entry Fee: ₹{t['entry_fee']}",
+            reply_markup=markup
+        )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('join_'))
+def join_tournament(call):
+    idx = int(call.data.split('_')[1])
+    t = tournaments[idx]
+    user = get_user(call.from_user.id)
+    entry_fee = t['entry_fee']
+
+    if user and user.get('wallet', 0) >= entry_fee:
+        # Deduct from wallet
+        update_wallet(call.from_user.id, -entry_fee)
+        update_points(call.from_user.id, 10)
+        verified_users.setdefault(t['name'], set()).add(call.from_user.id)
+        
+        bot.send_message(
+            call.message.chat.id,
+            f"✅ Joined <b>{t['name']}</b> using wallet! ₹{entry_fee} deducted.\n⭐ You earned 10 points.",
+            parse_mode='HTML'
+        )
+    else:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("💳 Pay Entry Fee", callback_data=f"pay_{idx}"))
+        bot.send_message(
+            call.message.chat.id,
+            f"To join <b>{t['name']}</b>, please pay ₹{entry_fee} and send your UTR after payment.",
+            parse_mode='HTML',
+            reply_markup=markup
+        )
+    bot.answer_callback_query(call.id)
 
 @bot.message_handler(func=lambda m: m.text in ['❌ Delete Tournament', '/deletetournament'])
 def delete_tournament(message):
