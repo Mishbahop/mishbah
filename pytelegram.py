@@ -1,8 +1,11 @@
 import telebot
-from users_db import add_user, set_user_games, get_user, get_all_users
+from users_db import (
+    add_user, set_user_games, get_user, get_all_users,
+    update_wallet, set_wallet, update_points, set_points
+)
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-BOT_TOKEN = '8006562475:AAH-M5q3U61BK83fk-9Z14PUI9ysLPkOjFQ'
+BOT_TOKEN = '8465757264:AAG9BAqpHkuDyRRmFR6DAjzUzNXpwQmazgU'
 ADMIN_IDS = [1905864597]  # Replace with your Telegram user ID(s)
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -14,6 +17,7 @@ payment_qr = None  # Store file_id of QR code
 pending_payments = {}  # user_id: {'utr': ..., 'tournament': ...}
 verified_users = {}  # tournament_name: set(user_ids)
 refund_requests = {}  # user_id: {'tournament': ..., 'upi': ...}
+admin_message_targets = {}  # admin_chat_id: target_user_id
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
@@ -29,6 +33,11 @@ def get_user_keyboard():
         KeyboardButton('🎫 My Tournaments')
     )
     markup.add(
+        KeyboardButton('💰 My Wallet'),
+        KeyboardButton('⭐ My Points')
+    )
+    markup.add(
+        KeyboardButton('➕ Deposit'),
         KeyboardButton('✉️ Contact Admin')
     )
     return markup
@@ -44,6 +53,11 @@ def get_admin_keyboard():
         KeyboardButton('🎫 My Tournaments')
     )
     markup.add(
+        KeyboardButton('💰 My Wallet'),
+        KeyboardButton('⭐ My Points')
+    )
+    markup.add(
+        KeyboardButton('➕ Deposit'),
         KeyboardButton('➕ Add Tournament'),
         KeyboardButton('❌ Delete Tournament')
     )
@@ -81,8 +95,19 @@ def start(message):
 
 @bot.message_handler(func=lambda m: m.text in ['📝 Register', '/register'])
 def register(message):
+    is_new = message.from_user.id not in users
     users.add(message.from_user.id)
     add_user(message.from_user.id, message.from_user.first_name)
+    # Alert admin if new user
+    if is_new:
+        for admin_id in ADMIN_IDS:
+            bot.send_message(
+                admin_id,
+                f"🆕 <b>New user joined!</b>\n"
+                f"Name: <a href='tg://user?id={message.from_user.id}'>{message.from_user.first_name}</a>\n"
+                f"User ID: <code>{message.from_user.id}</code>",
+                parse_mode='HTML'
+            )
     markup = InlineKeyboardMarkup()
     markup.add(
         InlineKeyboardButton("BGMI", callback_data="reg_BGMI"),
@@ -104,6 +129,94 @@ def select_game_notify(call):
     bot.answer_callback_query(call.id, f"Registered for {game} tournaments!")
     bot.send_message(call.message.chat.id, f"👍 You will be notified about upcoming {game} tournaments.")
 
+@bot.message_handler(func=lambda m: m.text == '💰 My Wallet')
+def my_wallet(message):
+    user = get_user(message.from_user.id)
+    if user:
+        bot.reply_to(message, f"💰 Your wallet balance: ₹{user.get('wallet', 0)}")
+    else:
+        bot.reply_to(message, "❗ User not found.")
+
+@bot.message_handler(func=lambda m: m.text == '⭐ My Points')
+def my_points(message):
+    user = get_user(message.from_user.id)
+    if user:
+        bot.reply_to(message, f"⭐ Your points: {user.get('points', 0)}")
+    else:
+        bot.reply_to(message, "❗ User not found.")
+
+@bot.message_handler(func=lambda m: m.text == '➕ Deposit')
+def deposit(message):
+    bot.reply_to(message, "Enter the amount you want to deposit (in ₹):")
+    bot.register_next_step_handler(message, deposit_amount)
+
+def deposit_amount(message):
+    try:
+        amount = int(message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        bot.reply_to(message, "❗ Please enter a valid positive amount:")
+        bot.register_next_step_handler(message, deposit_amount)
+        return
+    # Show payment QR and ask for UTR
+    if payment_qr:
+        bot.send_photo(message.chat.id, payment_qr, caption=f"Scan this QR to deposit ₹{amount}.")
+    else:
+        bot.reply_to(message, "No payment QR set by admin yet. Please try again later.")
+        return
+    bot.send_message(message.chat.id, "After payment, send your 12-digit UTR (transaction reference) below:")
+    bot.register_next_step_handler(message, deposit_utr, amount)
+
+def deposit_utr(message, amount):
+    utr = message.text.strip()
+    if not (utr.isdigit() and len(utr) == 12):
+        bot.reply_to(message, "❗ UTR must be a 12-digit number. Please send again:")
+        bot.register_next_step_handler(message, deposit_utr, amount)
+        return
+    # Notify admin for deposit verification
+    for admin_id in ADMIN_IDS:
+        bot.send_message(
+            admin_id,
+            f"💰 <b>Deposit Verification Needed</b>\n"
+            f"User: <a href='tg://user?id={message.from_user.id}'>{message.from_user.first_name}</a>\n"
+            f"Amount: ₹{amount}\n"
+            f"UTR: <code>{utr}</code>",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Approve", callback_data=f"depapprove_{message.from_user.id}_{amount}"),
+                 InlineKeyboardButton("❌ Reject", callback_data=f"depreject_{message.from_user.id}_{amount}")]
+            ])
+        )
+    bot.reply_to(message, "🧾 Deposit UTR received. Please wait for admin verification.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('depapprove_') or call.data.startswith('depreject_'))
+def verify_deposit(call):
+    parts = call.data.split('_')
+    user_id = int(parts[1])
+    amount = int(parts[2])
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "🚫 Only admin can verify deposits.")
+        return
+    if call.data.startswith('depapprove_'):
+        update_wallet(user_id, amount)
+        bot.send_message(user_id, f"✅ Your deposit of ₹{amount} has been added to your wallet!")
+        bot.edit_message_text(
+            f"✅ Deposit approved for user <code>{user_id}</code> (₹{amount}).",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='HTML'
+        )
+    else:
+        bot.send_message(user_id, f"❌ Your deposit of ₹{amount} was rejected. Please contact admin.")
+        bot.edit_message_text(
+            f"❌ Deposit rejected for user <code>{user_id}</code> (₹{amount}).",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='HTML'
+        )
+    bot.answer_callback_query(call.id)
+
 @bot.message_handler(func=lambda m: m.text in ['🏆 Tournaments', '/tournaments'])
 def tournaments_cmd(message):
     if not tournaments:
@@ -120,14 +233,27 @@ def tournaments_cmd(message):
 def join_tournament(call):
     idx = int(call.data.split('_')[1])
     t = tournaments[idx]
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("💳 Payment", callback_data=f"pay_{idx}"))
-    bot.send_message(
-        call.message.chat.id,
-        f"To join <b>{t['name']}</b>, please pay the entry fee and submit your UTR after payment.",
-        parse_mode='HTML',
-        reply_markup=markup
-    )
+    user = get_user(call.from_user.id)
+    # Try to extract entry fee as integer from prize string
+    try:
+        entry_fee = int(''.join(filter(str.isdigit, t['prize'])))
+    except Exception:
+        entry_fee = 0
+    if user and user.get('wallet', 0) >= entry_fee and entry_fee > 0:
+        # Deduct and join directly
+        update_wallet(call.from_user.id, -entry_fee)
+        update_points(call.from_user.id, 10)  # Example: add 10 points for joining
+        verified_users.setdefault(t['name'], set()).add(call.from_user.id)
+        bot.send_message(call.message.chat.id, f"✅ Joined <b>{t['name']}</b> using wallet! ₹{entry_fee} deducted.\n⭐ You earned 10 points.", parse_mode='HTML')
+    else:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("💳 Payment", callback_data=f"pay_{idx}"))
+        bot.send_message(
+            call.message.chat.id,
+            f"To join <b>{t['name']}</b>, please pay the entry fee and submit your UTR after payment.",
+            parse_mode='HTML',
+            reply_markup=markup
+        )
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('pay_'))
@@ -178,7 +304,8 @@ def verify_utr(call):
     tournament = pending_payments[user_id]['tournament']
     if call.data.startswith('approve_'):
         verified_users.setdefault(tournament, set()).add(user_id)
-        bot.send_message(user_id, f"✅ Your payment for <b>{tournament}</b> is verified! You are now added to the tournament.", parse_mode='HTML')
+        update_points(user_id, 10)  # Award points for joining via payment
+        bot.send_message(user_id, f"✅ Your payment for <b>{tournament}</b> is verified! You are now added to the tournament.\n⭐ You earned 10 points.", parse_mode='HTML')
         bot.edit_message_text(
             f"✅ Payment approved for user <code>{user_id}</code> in <b>{tournament}</b>.",
             chat_id=call.message.chat.id,
@@ -405,39 +532,6 @@ def forward_to_admin(message):
     bot.reply_to(message, "✅ Your message has been sent to the admin. You will get a reply soon.")
 
 # Admin: Send message to user by user ID
-@bot.message_handler(func=lambda m: m.text == '📨 Message User')
-def admin_message_user(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "🚫 Only admin can use this feature.")
-        return
-    bot.reply_to(message, "Please enter the user ID you want to message:")
-    bot.register_next_step_handler(message, get_user_id_for_message)
-
-def get_user_id_for_message(message):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        user_id = int(message.text.strip())
-    except ValueError:
-        bot.reply_to(message, "❗ Invalid user ID. Please enter a numeric user ID:")
-        bot.register_next_step_handler(message, get_user_id_for_message)
-        return
-    message.chat._admin_target_user_id = user_id  # Store in chat object
-    bot.reply_to(message, "Now type the message you want to send to this user:")
-    bot.register_next_step_handler(message, send_admin_message_to_user)
-
-def get_user_id_for_message(message):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        user_id = int(message.text.strip())
-    except ValueError:
-        bot.reply_to(message, "❗ Invalid user ID. Please enter a numeric user ID:")
-        bot.register_next_step_handler(message, get_user_id_for_message)
-        return
-    
-admin_message_targets = {}  # admin_chat_id: target_user_id
-
 @bot.message_handler(func=lambda m: m.text == '📨 Message User')
 def admin_message_user(message):
     if not is_admin(message.from_user.id):
